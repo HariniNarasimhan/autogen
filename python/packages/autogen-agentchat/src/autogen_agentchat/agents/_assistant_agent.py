@@ -1170,7 +1170,10 @@ class AssistantAgent(BaseChatAgent, Component[AssistantAgentConfig]):
         workbench: Workbench,
         handoff_tools: List[BaseTool[Any, Any]],
         cancellation_token: CancellationToken,
-    ) -> AsyncGenerator[Response | ModelClientStreamingChunkEvent | ThoughtEvent, None]:
+    ) -> AsyncGenerator[
+        Union[Response, ModelClientStreamingChunkEvent, ThoughtEvent, ToolCallExecutionEvent, ToolCallRequestEvent],
+        None,
+    ]:
         """
         If reflect_on_tool_use=True, we do another inference based on tool results
         and yield the final text response (or streaming chunks).
@@ -1276,7 +1279,8 @@ class AssistantAgent(BaseChatAgent, Component[AssistantAgentConfig]):
         yield tool_call_result_msg
 
         # Recursively call _reflect_on_tool_use_flow with updated context
-        async for recursive_response in cls._reflect_on_tool_use_flow(
+        async for response in cls._reflect_on_tool_use_flow(
+            system_messages=system_messages,
             model_client=model_client,
             model_client_stream=model_client_stream,
             model_context=model_context,
@@ -1287,7 +1291,7 @@ class AssistantAgent(BaseChatAgent, Component[AssistantAgentConfig]):
             handoff_tools=handoff_tools,
             cancellation_token=cancellation_token,
         ):
-            yield recursive_response
+            yield response
 
     @staticmethod
     def _summarize_tool_use(
