@@ -1070,6 +1070,9 @@ class AssistantAgent(BaseChatAgent, Component[AssistantAgentConfig]):
                 agent_name=agent_name,
                 inner_messages=inner_messages,
                 output_content_type=output_content_type,
+                workbench=workbench,
+                handoff_tools=handoff_tools,
+                cancellation_token=cancellation_token,
             ):
                 yield reflection_response
         else:
@@ -1164,6 +1167,9 @@ class AssistantAgent(BaseChatAgent, Component[AssistantAgentConfig]):
         agent_name: str,
         inner_messages: List[BaseAgentEvent | BaseChatMessage],
         output_content_type: type[BaseModel] | None,
+        workbench: Workbench,
+        handoff_tools: List[BaseTool[Any, Any]],
+        cancellation_token: CancellationToken,
     ) -> AsyncGenerator[Response | ModelClientStreamingChunkEvent | ThoughtEvent, None]:
         """
         If reflect_on_tool_use=True, we do another inference based on tool results
@@ -1188,7 +1194,8 @@ class AssistantAgent(BaseChatAgent, Component[AssistantAgentConfig]):
         else:
             reflection_result = await model_client.create(llm_messages, json_output=output_content_type)
 
-        if not reflection_result or not isinstance(reflection_result.content, str):
+        # Handle: if reflection is None
+        if not reflection_result:
             raise RuntimeError("Reflect on tool use produced no valid text response.")
 
         # --- NEW: If the reflection produced a thought, yield it ---
@@ -1205,26 +1212,82 @@ class AssistantAgent(BaseChatAgent, Component[AssistantAgentConfig]):
                 thought=getattr(reflection_result, "thought", None),
             )
         )
+        if isinstance(reflection_result.content, str):
+            if output_content_type:
+                content = output_content_type.model_validate_json(reflection_result.content)
+                yield Response(
+                    chat_message=StructuredMessage[output_content_type](  # type: ignore[valid-type]
+                        content=content,
+                        source=agent_name,
+                        models_usage=reflection_result.usage,
+                    ),
+                    inner_messages=inner_messages,
+                )
+                return
+            else:
+                yield Response(
+                    chat_message=TextMessage(
+                        content=reflection_result.content,
+                        source=agent_name,
+                        models_usage=reflection_result.usage,
+                    ),
+                    inner_messages=inner_messages,
+                )
+                return
 
-        if output_content_type:
-            content = output_content_type.model_validate_json(reflection_result.content)
-            yield Response(
-                chat_message=StructuredMessage[output_content_type](  # type: ignore[valid-type]
-                    content=content,
-                    source=agent_name,
-                    models_usage=reflection_result.usage,
-                ),
-                inner_messages=inner_messages,
-            )
-        else:
-            yield Response(
-                chat_message=TextMessage(
-                    content=reflection_result.content,
-                    source=agent_name,
-                    models_usage=reflection_result.usage,
-                ),
-                inner_messages=inner_messages,
-            )
+        # Otherwise, we have function calls in the reflection result - handle them recursively
+        assert isinstance(reflection_result.content, list) and all(
+            isinstance(item, FunctionCall) for item in reflection_result.content
+        )
+
+        # STEP 1: Yield ToolCallRequestEvent
+        tool_call_msg = ToolCallRequestEvent(
+            content=reflection_result.content,
+            source=agent_name,
+            models_usage=reflection_result.usage,
+        )
+        event_logger.debug(tool_call_msg)
+        inner_messages.append(tool_call_msg)
+        yield tool_call_msg
+
+        # STEP 2: Execute tool calls
+        executed_calls_and_results = await asyncio.gather(
+            *[
+                cls._execute_tool_call(
+                    tool_call=call,
+                    workbench=workbench,
+                    handoff_tools=handoff_tools,
+                    agent_name=agent_name,
+                    cancellation_token=cancellation_token,
+                )
+                for call in reflection_result.content
+            ]
+        )
+        exec_results = [result for _, result in executed_calls_and_results]
+
+        # STEP 3: Yield ToolCallExecutionEvent
+        tool_call_result_msg = ToolCallExecutionEvent(
+            content=exec_results,
+            source=agent_name,
+        )
+        event_logger.debug(tool_call_result_msg)
+        await model_context.add_message(FunctionExecutionResultMessage(content=exec_results))
+        inner_messages.append(tool_call_result_msg)
+        yield tool_call_result_msg
+
+        # Recursively call _reflect_on_tool_use_flow with updated context
+        async for recursive_response in cls._reflect_on_tool_use_flow(
+            model_client=model_client,
+            model_client_stream=model_client_stream,
+            model_context=model_context,
+            agent_name=agent_name,
+            inner_messages=inner_messages,
+            output_content_type=output_content_type,
+            workbench=workbench,
+            handoff_tools=handoff_tools,
+            cancellation_token=cancellation_token,
+        ):
+            yield recursive_response
 
     @staticmethod
     def _summarize_tool_use(
